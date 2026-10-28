@@ -1,33 +1,29 @@
-# 单机网页工作台
+# Web 服务部署速查
 
-## 启动
-
-在 PowerShell 中先切换到项目根目录，然后执行：
+从项目根目录执行。首次运行先按根目录 README 配置 `.env` 并启动 PostgreSQL、MinIO。
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
+python scripts\run_db_migrations.py
+python scripts\create_user.py admin 管理员 --role ADMIN
 python scripts\run_local_web_app.py --data-root .\data
 ```
 
-然后打开：
+浏览器打开 `http://127.0.0.1:8000`。PostgreSQL 业务数据库和 Checkpoint 数据库分别由 `DATABASE_URL` 与 `CHECKPOINT_DATABASE_URL` 配置；MinIO endpoint、bucket 和访问凭据由 `.env` 配置。
 
-```text
-http://127.0.0.1:8000
+网页上传的原始 Excel、每个 LangGraph 节点生成的底稿和正式报表都存入 MinIO。PostgreSQL 文件索引保存对象键、文件哈希、大小、版本、上传人等信息；本地 `data/runs/{run_id}` 是供现有 Excel 计算函数使用的工作区，服务恢复任务时会从 MinIO 重建或校验文件。
+
+LangGraph 以数据库 `workflow_runs.thread_id` 作为 Checkpoint 标识。出现差异后，审核人员使用网页提交修正；系统将审核记录追加到 PostgreSQL，再使用相同 `thread_id` 运行 `Command(resume=...)`。API 不接受客户端自报审核人，审核人来自登录会话。
+
+`FINANCE` 可以创建和启动任务；`REVIEWER` 与 `ADMIN` 可以提交修正。用户通过以下命令创建，密码以交互方式输入，不写入源码：
+
+```powershell
+python scripts\create_user.py <用户名> <显示姓名> --role FINANCE
+python scripts\create_user.py <用户名> <显示姓名> --role REVIEWER
 ```
 
-网页会自动生成业务 `run_id` 和 LangGraph `thread_id`，财务人员不需要输入它们。每次运行的上传资料位于 `data\runs\{run_id}\input\`，底稿位于同一任务的 `output\`；网页层的运行索引保存在 `data\app.sqlite`，LangGraph Checkpoint 保存在 `data\langgraph_checkpoints.sqlite`。
+首次创建业务表时执行 Alembic 迁移；LangGraph PostgreSQL Checkpointer 在首次构建时调用 `PostgresSaver.setup()`。服务启动时会把数据库中遗留的 `QUEUED`/`RUNNING` 任务重新入队；`WAITING_REVIEW` 任务维持暂停状态。
 
-## 流程
-
-1. 选择年度、月份和经办人，批量上传资料；
-2. 页面自动执行预检，显示识别出的文件；缺件时可补充或替换资料后重新预检；
-3. 预检通过后点击“开始计算”，后端串行执行一个工作流；
-4. M7 全部为零时直接下载正式报表；
-5. 存在差异时，页面显示审核材料、主体拆分和无票证据；
-6. 填写正确营业收入、审核人和原因，点击提交继续；
-7. 后端使用同一个 `thread_id` 恢复，重算 M5、M6、M7；
-8. 仍有差异时进入下一轮审核，归零后才发布正式 `.xls`。
-
-网页服务只适合本机或受控局域网使用。原始上传文件在任务开始后不应修改；如资料需要更换，建议新建任务。
+真实财务资料、数据库文件、导出报表和 `.env` 均属于运行数据，不应提交到 Git。旧 SQLite 记录和旧 Checkpoint 不会自动迁移。

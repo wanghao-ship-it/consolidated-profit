@@ -8,10 +8,12 @@
 from __future__ import annotations
 
 import copy
+from contextvars import ContextVar
 from dataclasses import asdict
 from datetime import datetime
 from decimal import Decimal
 import hashlib
+import inspect
 import json
 from operator import add
 from pathlib import Path
@@ -24,6 +26,51 @@ from openpyxl.styles import Font
 from pydantic import BaseModel, Field
 
 import renheng_profit as core
+
+
+_ARTIFACT_REFERENCE_RESOLVER: ContextVar[Any | None] = ContextVar(
+    "profit_artifact_reference_resolver", default=None
+)
+
+
+def _artifact_path(state: ProfitWorkflowState, key: str) -> Path:
+    reference = state.get("artifacts", {}).get(key)
+    if not reference:
+        raise FileNotFoundError(f"工作流产物索引不存在：{key}")
+    resolver = _ARTIFACT_REFERENCE_RESOLVER.get()
+    if resolver is not None and str(reference).startswith("minio://"):
+        return resolver(str(reference))
+    return Path(reference)
+
+
+def _reference_path(reference: str) -> Path:
+    resolver = _ARTIFACT_REFERENCE_RESOLVER.get()
+    if resolver is not None and reference.startswith("minio://"):
+        return resolver(reference)
+    return Path(reference)
+
+
+def _wrap_node(node, artifact_persister=None, artifact_resolver=None):
+    if artifact_persister is None and artifact_resolver is None:
+        return node
+
+    def wrapped(state, config):
+        run_id = str(config.get("configurable", {}).get("run_id", ""))
+        resolver = None
+        if artifact_resolver is not None:
+            resolver = lambda reference: artifact_resolver(run_id, reference)
+        token = _ARTIFACT_REFERENCE_RESOLVER.set(resolver)
+        try:
+            parameters = inspect.signature(node).parameters
+            updates = node(state, config) if len(parameters) > 1 else node(state)
+            if artifact_persister is not None:
+                updates = artifact_persister(run_id, updates or {})
+            return updates
+        finally:
+            _ARTIFACT_REFERENCE_RESOLVER.reset(token)
+
+    wrapped.__name__ = getattr(node, "__name__", "workflow_node")
+    return wrapped
 
 
 def merge_artifacts(left: dict[str, str], right: dict[str, str]) -> dict[str, str]:
@@ -178,6 +225,7 @@ def _fingerprint(paths: list[Path], policy: dict[str, Any]) -> str:
 
 
 def _serialize_sources(sources: list[core.SourceFile]) -> list[str]:
+    """将选中的利润表主体转换为 Checkpoint 可保存的文件路径列表。"""
     return [source.path for source in sources]
 
 
@@ -354,7 +402,12 @@ def prepare_run(state: ProfitWorkflowState, config) -> dict[str, Any]:
                 "年度": state["year"],
                 "月份": state["month"],
                 "规则版本": core.RULE_VERSION,
-                "已选文件": state["selected_files"],
+                "已选文件": {
+                    key: [Path(value).name for value in values]
+                    if isinstance(values, list)
+                    else Path(values).name
+                    for key, values in state["selected_files"].items()
+                },
                 "本年期间政策": state["current_period_policy"],
                 "去年期间政策": state["prior_period_policy"],
                 "本年输入指纹": state["current_input_fingerprint"],
@@ -378,18 +431,24 @@ def prepare_run(state: ProfitWorkflowState, config) -> dict[str, Any]:
     return updates
 
 
-def _write_parse_bundle(path: Path, sources: list[core.SourceFile]) -> None:
+def _write_parse_bundle(path: Path, sources: list[core.SourceFile], source_root: Path) -> None:
     metadata: list[core.ParseMetadata] = []
     parsed: dict[str, dict[str, dict[str, Any]]] = {}
     for source in sources:
         parse_info, normalized = core.parse_income_statement(source)
+        parse_info.file = Path(parse_info.file).resolve().relative_to(source_root.resolve()).as_posix()
         metadata.append(parse_info)
         parsed[source.company] = normalized
+    source_rows = []
+    for source in sources:
+        row = asdict(source)
+        row["path"] = Path(source.path).resolve().relative_to(source_root.resolve()).as_posix()
+        source_rows.append(row)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         json.dumps(
             {
-                "sources": [asdict(source) for source in sources],
+                "sources": source_rows,
                 "metadata": [asdict(item) for item in metadata],
                 "parsed": parsed,
             },
@@ -430,7 +489,11 @@ def _load_parse_bundle(path: Path) -> tuple[list[core.SourceFile], list[core.Par
 
 def current_m2_parse(state: ProfitWorkflowState) -> dict[str, Any]:
     path = _dirs(state)["m2"] / "本年" / "01_单体数据与研发拆分.json"
-    _write_parse_bundle(path, _sources_from_state(state, "current_profit_statements"))
+    _write_parse_bundle(
+        path,
+        _sources_from_state(state, "current_profit_statements"),
+        Path(state["source_dir"]),
+    )
     return {"artifacts": {"current_m2": str(path)}}
 
 
@@ -469,8 +532,8 @@ def _calculation_settings(policy: dict[str, Any]) -> dict[str, Any]:
 
 
 def current_m3_pre_elimination(state: ProfitWorkflowState) -> dict[str, Any]:
-    sources, metadata, parsed = _load_parse_bundle(Path(state["artifacts"]["current_m2"]))
-    overrides = _load_invoice_overrides(Path(state["artifacts"]["current_invoice_revenue"]))
+    sources, metadata, parsed = _load_parse_bundle(_artifact_path(state, "current_m2"))
+    overrides = _load_invoice_overrides(_artifact_path(state, "current_invoice_revenue"))
     settings = _calculation_settings(state["current_period_policy"])
     summary = core.aggregate_six_companies(
         parsed, settings["quarterly_companies"], overrides, settings["cumulative_only"]
@@ -495,9 +558,9 @@ def current_m4_internal_sales(state: ProfitWorkflowState) -> dict[str, Any]:
 
 def current_m5_final(state: ProfitWorkflowState) -> dict[str, Any]:
     path = core.run_m5(
-        Path(state["artifacts"]["current_m3"]),
-        Path(state["artifacts"]["current_m4_summary"]),
-        Path(state["artifacts"]["current_m4_detail"]),
+        _artifact_path(state, "current_m3"),
+        _artifact_path(state, "current_m4_summary"),
+        _artifact_path(state, "current_m4_detail"),
         _dirs(state)["m5"] / "本年",
     )
     return {"artifacts": {"current_m5": str(path)}}
@@ -505,12 +568,16 @@ def current_m5_final(state: ProfitWorkflowState) -> dict[str, Any]:
 
 def prior_m2_parse(state: ProfitWorkflowState) -> dict[str, Any]:
     path = _dirs(state)["m2"] / "去年同期" / "01_单体数据与研发拆分.json"
-    _write_parse_bundle(path, _sources_from_state(state, "prior_profit_statements"))
+    _write_parse_bundle(
+        path,
+        _sources_from_state(state, "prior_profit_statements"),
+        Path(state["source_dir"]),
+    )
     return {"artifacts": {"prior_m2": str(path)}}
 
 
 def prior_m3_pre_summary(state: ProfitWorkflowState) -> dict[str, Any]:
-    sources, metadata, parsed = _load_parse_bundle(Path(state["artifacts"]["prior_m2"]))
+    sources, metadata, parsed = _load_parse_bundle(_artifact_path(state, "prior_m2"))
     settings = _calculation_settings(state["prior_period_policy"])
     summary = core.aggregate_six_companies(
         parsed, settings["quarterly_companies"], None, settings["cumulative_only"]
@@ -532,7 +599,7 @@ def prior_m4_ledger_components(state: ProfitWorkflowState) -> dict[str, Any]:
     us_internal = core.read_prior_ledger_us_internal(
         dataset.file, state["month"], confirmation, policy["us_quarter_start"]
     )
-    pre_rows = core.read_pre_elimination_summary(Path(state["artifacts"]["prior_m3"]))
+    pre_rows = core.read_pre_elimination_summary(_artifact_path(state, "prior_m3"))
     revenue_row = next(row for row in pre_rows if row["项目"] == "营业收入")
     us_revenue = {
         "本月": core.elimination_to_money(revenue_row.get(f"{core.US_COMPANY}_本月", "0")),
@@ -554,9 +621,9 @@ def prior_m4_ledger_components(state: ProfitWorkflowState) -> dict[str, Any]:
 
 def prior_m5_final(state: ProfitWorkflowState) -> dict[str, Any]:
     components = _restore_money(
-        json.loads(Path(state["artifacts"]["prior_m4_components"]).read_text(encoding="utf-8"))
+        json.loads(_artifact_path(state, "prior_m4_components").read_text(encoding="utf-8"))
     )
-    pre_rows = core.read_pre_elimination_summary(Path(state["artifacts"]["prior_m3"]))
+    pre_rows = core.read_pre_elimination_summary(_artifact_path(state, "prior_m3"))
     monthly = components["domestic_ledger"]["本月"] - components["us_internal"]["本月"] + components["us_revenue"]["本月"]
     cumulative = components["domestic_ledger"]["累计"] - components["us_internal"]["累计"] + components["us_revenue"]["累计"]
     rows = core.build_prior_year_rows(pre_rows, monthly, cumulative)
@@ -574,14 +641,14 @@ def _self_sales_and_us(state: ProfitWorkflowState) -> tuple[dict[str, Any], dict
     )
     prior_dataset = core.read_ledger_dataset(Path(state["source_dir"]), state["year"] - 1, state["month"])
     prior_yangyuan = core.read_prior_sales_ledger(prior_dataset.file, state["month"])
-    current_us = core.read_us_xinjiang_revenue(Path(state["artifacts"]["current_m3"]))
-    prior_us = core.read_us_xinjiang_revenue(Path(state["artifacts"]["prior_m3"]))
+    current_us = core.read_us_xinjiang_revenue(_artifact_path(state, "current_m3"))
+    prior_us = core.read_us_xinjiang_revenue(_artifact_path(state, "prior_m3"))
     return current_yangyuan, prior_yangyuan, current_us, prior_us
 
 
 def m6_preview(state: ProfitWorkflowState) -> dict[str, Any]:
-    current_rows = core.read_result_rows(Path(state["artifacts"]["current_m5"]))
-    prior_rows = core.read_result_rows(Path(state["artifacts"]["prior_m5"]))
+    current_rows = core.read_result_rows(_artifact_path(state, "current_m5"))
+    prior_rows = core.read_result_rows(_artifact_path(state, "prior_m5"))
     output = core.write_m6_outputs(
         _dirs(state)["m6"], core.build_m6_output_rows(prior_rows, current_rows)
     )
@@ -604,15 +671,15 @@ def _m7_inputs(state: ProfitWorkflowState) -> tuple[Any, ...]:
     current_settings = _calculation_settings(state["current_period_policy"])
     prior_policy = state["prior_period_policy"]
     us_buyer_internal = core.read_us_buyer_internal(
-        Path(state["artifacts"]["current_m4_detail"]),
+        _artifact_path(state, "current_m4_detail"),
         int(current_settings["us_confirmation_month"] or 0), month,
     )
     prior_us_internal = core.read_prior_ledger_us_internal(
         prior_dataset.file, month, int(prior_policy["us_confirmation_month"] or 0),
         prior_policy["us_quarter_start"],
     )
-    current_us = core.read_us_xinjiang_revenue(Path(state["artifacts"]["current_m3"]))
-    prior_us = core.read_us_xinjiang_revenue(Path(state["artifacts"]["prior_m3"]))
+    current_us = core.read_us_xinjiang_revenue(_artifact_path(state, "current_m3"))
+    prior_us = core.read_us_xinjiang_revenue(_artifact_path(state, "prior_m3"))
     return (
         current_dataset, prior_dataset, current_ledger, prior_domestic,
         current_us, us_buyer_internal, prior_us, prior_us_internal,
@@ -622,8 +689,8 @@ def _m7_inputs(state: ProfitWorkflowState) -> tuple[Any, ...]:
 def m7_group_validation(state: ProfitWorkflowState) -> dict[str, Any]:
     _, _, current_ledger, prior_domestic, current_us, us_buyer_internal, prior_us, prior_us_internal = _m7_inputs(state)
     rows = core.build_m7_validation_rows(
-        core.read_result_rows(Path(state["artifacts"]["current_m5"])),
-        core.read_result_rows(Path(state["artifacts"]["prior_m5"])),
+        core.read_result_rows(_artifact_path(state, "current_m5")),
+        core.read_result_rows(_artifact_path(state, "prior_m5")),
         current_ledger, prior_domestic, current_us, us_buyer_internal, prior_us, prior_us_internal,
     )
     output = core.write_m7_validation_outputs(_dirs(state)["m7"], rows)
@@ -730,8 +797,8 @@ def prepare_difference_review(state: ProfitWorkflowState) -> dict[str, Any]:
         current_dataset, prior_dataset, state["year"], state["month"],
     )
     subject_rows = core.build_current_subject_m7_breakdown(
-        Path(state["artifacts"]["current_m3"]),
-        Path(state["artifacts"]["current_m4_summary"]),
+        _artifact_path(state, "current_m3"),
+        _artifact_path(state, "current_m4_summary"),
         current_ledger,
         rows,
     )
@@ -822,6 +889,7 @@ def _load_or_save_base(path: Path, rows: list[dict[str, str]]) -> list[dict[str,
 def review_and_correct_revenue(state: ProfitWorkflowState) -> dict[str, Any]:
     from langgraph.types import interrupt
 
+    review_file = _reference_path(state["difference_review_path"])
     response = interrupt({
         "workflow_status": "WAITING_REVIEW",
         "review_round": state["review_round"],
@@ -836,14 +904,16 @@ def review_and_correct_revenue(state: ProfitWorkflowState) -> dict[str, Any]:
     correction = _validate_correction(state, response)
     _verify_fingerprints(state)
 
-    review_dir = Path(state["difference_review_path"]).parent
-    current_path = Path(state["artifacts"]["current_m5"])
-    prior_path = Path(state["artifacts"]["prior_m5"])
+    review_dir = review_file.parent
+    current_path = _artifact_path(state, "current_m5")
+    prior_path = _artifact_path(state, "prior_m5")
+    current_base_path = review_dir / "04_本年修正前M5.json"
+    prior_base_path = review_dir / "05_去年修正前M5.json"
     current_base = _load_or_save_base(
-        review_dir / "04_本年修正前M5.json", core.read_result_rows(current_path)
+        current_base_path, core.read_result_rows(current_path)
     )
     prior_base = _load_or_save_base(
-        review_dir / "05_去年修正前M5.json", core.read_result_rows(prior_path)
+        prior_base_path, core.read_result_rows(prior_path)
     )
     values = correction["corrected_revenue"]
     current_rows = _apply_correct_values(
@@ -873,7 +943,13 @@ def review_and_correct_revenue(state: ProfitWorkflowState) -> dict[str, Any]:
         "workflow_status": "RUNNING",
         "corrected_revenue": correction,
         "review_history": [record],
-        "artifacts": {f"correction_round_{state['review_round']:02d}": str(record_path)},
+        "artifacts": {
+            f"correction_round_{state['review_round']:02d}": str(record_path),
+            f"review_base_current_round_{state['review_round']:02d}": str(current_base_path),
+            f"review_base_prior_round_{state['review_round']:02d}": str(prior_base_path),
+            "current_m5": str(current_path),
+            "prior_m5": str(prior_path),
+        },
     }
     _write_status(state, updates)
     return updates
@@ -882,8 +958,8 @@ def review_and_correct_revenue(state: ProfitWorkflowState) -> dict[str, Any]:
 def publish_report(state: ProfitWorkflowState) -> dict[str, Any]:
     if state.get("has_difference") or core.nonzero_m7_keys(state["m7_differences"]):
         raise RuntimeError("M7四组差异未全部归零，禁止生成正式报表")
-    current_rows = core.read_result_rows(Path(state["artifacts"]["current_m5"]))
-    prior_rows = core.read_result_rows(Path(state["artifacts"]["prior_m5"]))
+    current_rows = core.read_result_rows(_artifact_path(state, "current_m5"))
+    prior_rows = core.read_result_rows(_artifact_path(state, "prior_m5"))
     current_yangyuan, prior_yangyuan, current_us, prior_us = _self_sales_and_us(state)
     output = _dirs(state)["m6"] / f"02_长安仁恒{state['year']}年{state['month']}月合并报表（正式）.xls"
     core.write_final_template(
@@ -901,15 +977,15 @@ def publish_report(state: ProfitWorkflowState) -> dict[str, Any]:
     return updates
 
 
-def build_current_year_subgraph():
+def build_current_year_subgraph(artifact_persister=None, artifact_resolver=None):
     from langgraph.graph import END, START, StateGraph
 
     builder = StateGraph(ProfitWorkflowState)
-    builder.add_node("current_m2_parse", current_m2_parse)
-    builder.add_node("current_invoice_revenue", current_invoice_revenue)
-    builder.add_node("current_m3_pre_elimination", current_m3_pre_elimination)
-    builder.add_node("current_m4_internal_sales", current_m4_internal_sales)
-    builder.add_node("current_m5_final", current_m5_final)
+    builder.add_node("current_m2_parse", _wrap_node(current_m2_parse, artifact_persister, artifact_resolver))
+    builder.add_node("current_invoice_revenue", _wrap_node(current_invoice_revenue, artifact_persister, artifact_resolver))
+    builder.add_node("current_m3_pre_elimination", _wrap_node(current_m3_pre_elimination, artifact_persister, artifact_resolver))
+    builder.add_node("current_m4_internal_sales", _wrap_node(current_m4_internal_sales, artifact_persister, artifact_resolver))
+    builder.add_node("current_m5_final", _wrap_node(current_m5_final, artifact_persister, artifact_resolver))
     builder.add_edge(START, "current_m2_parse")
     builder.add_edge("current_m2_parse", "current_invoice_revenue")
     builder.add_edge("current_invoice_revenue", "current_m3_pre_elimination")
@@ -919,14 +995,14 @@ def build_current_year_subgraph():
     return builder.compile()
 
 
-def build_prior_year_subgraph():
+def build_prior_year_subgraph(artifact_persister=None, artifact_resolver=None):
     from langgraph.graph import END, START, StateGraph
 
     builder = StateGraph(ProfitWorkflowState)
-    builder.add_node("prior_m2_parse", prior_m2_parse)
-    builder.add_node("prior_m3_pre_summary", prior_m3_pre_summary)
-    builder.add_node("prior_m4_ledger_components", prior_m4_ledger_components)
-    builder.add_node("prior_m5_final", prior_m5_final)
+    builder.add_node("prior_m2_parse", _wrap_node(prior_m2_parse, artifact_persister, artifact_resolver))
+    builder.add_node("prior_m3_pre_summary", _wrap_node(prior_m3_pre_summary, artifact_persister, artifact_resolver))
+    builder.add_node("prior_m4_ledger_components", _wrap_node(prior_m4_ledger_components, artifact_persister, artifact_resolver))
+    builder.add_node("prior_m5_final", _wrap_node(prior_m5_final, artifact_persister, artifact_resolver))
     builder.add_edge(START, "prior_m2_parse")
     builder.add_edge("prior_m2_parse", "prior_m3_pre_summary")
     builder.add_edge("prior_m3_pre_summary", "prior_m4_ledger_components")
@@ -935,20 +1011,26 @@ def build_prior_year_subgraph():
     return builder.compile()
 
 
-def build_workflow(checkpointer=None):
+def build_workflow(checkpointer=None, artifact_persister=None, artifact_resolver=None):
     from langgraph.graph import END, START, StateGraph
 
     builder = StateGraph(ProfitWorkflowState)
-    builder.add_node("determine_period_policy", determine_period_policy)
-    builder.add_node("preflight", preflight)
-    builder.add_node("prepare_run", prepare_run)
-    builder.add_node("current_year_subgraph", build_current_year_subgraph())
-    builder.add_node("prior_year_subgraph", build_prior_year_subgraph())
-    builder.add_node("m6_preview", m6_preview)
-    builder.add_node("m7_group_validation", m7_group_validation)
-    builder.add_node("prepare_difference_review", prepare_difference_review)
-    builder.add_node("review_and_correct_revenue", review_and_correct_revenue)
-    builder.add_node("publish_report", publish_report)
+    builder.add_node("determine_period_policy", _wrap_node(determine_period_policy, artifact_persister, artifact_resolver))
+    builder.add_node("preflight", _wrap_node(preflight, artifact_persister, artifact_resolver))
+    builder.add_node("prepare_run", _wrap_node(prepare_run, artifact_persister, artifact_resolver))
+    builder.add_node(
+        "current_year_subgraph",
+        build_current_year_subgraph(artifact_persister, artifact_resolver),
+    )
+    builder.add_node(
+        "prior_year_subgraph",
+        build_prior_year_subgraph(artifact_persister, artifact_resolver),
+    )
+    builder.add_node("m6_preview", _wrap_node(m6_preview, artifact_persister, artifact_resolver))
+    builder.add_node("m7_group_validation", _wrap_node(m7_group_validation, artifact_persister, artifact_resolver))
+    builder.add_node("prepare_difference_review", _wrap_node(prepare_difference_review, artifact_persister, artifact_resolver))
+    builder.add_node("review_and_correct_revenue", _wrap_node(review_and_correct_revenue, artifact_persister, artifact_resolver))
+    builder.add_node("publish_report", _wrap_node(publish_report, artifact_persister, artifact_resolver))
 
     builder.add_edge(START, "determine_period_policy")
     builder.add_edge("determine_period_policy", "preflight")

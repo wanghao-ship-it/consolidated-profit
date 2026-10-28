@@ -21,3 +21,7 @@ __pycache__/
 .env.*
 !.env.example
 .vscode/
+
+# Private reference material
+/reference/
+/references/

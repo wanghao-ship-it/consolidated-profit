@@ -19,11 +19,16 @@ def main(argv: list[str] | None = None) -> int:
     try:
         import uvicorn
         from renheng_web.app import create_app
+        from renheng_web.settings import ConfigurationError
     except ImportError as error:
         raise SystemExit(
             "缺少网页依赖，请先执行：python -m pip install -r requirements.txt"
         ) from error
-    uvicorn.run(create_app(args.data_root), host=args.host, port=args.port)
+    try:
+        app = create_app(args.data_root)
+    except (ConfigurationError, RuntimeError) as error:
+        raise SystemExit(f"服务初始化失败：{error}") from error
+    uvicorn.run(app, host=args.host, port=args.port)
     return 0
 
 
