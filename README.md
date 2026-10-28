@@ -36,7 +36,6 @@ LangGraph 的 PostgreSQL Checkpoint 需要在首次使用时创建其内部表�
    Copy-Item .env.example .env
    ```
 
-   编辑 `.env`，替换 PostgreSQL 密码、MinIO 密码和 `SESSION_SECRET_KEY`。不要把 `.env`、财务 Excel、数据库文件或真实运行数据提交到 Git。DSN 中含有 `@`、`/`、`:` 等特殊字符时，请先对密码做 URL 编码。
 
 2. 启动 PostgreSQL 和 MinIO：
 
@@ -71,7 +70,6 @@ LangGraph 的 PostgreSQL Checkpoint 需要在首次使用时创建其内部表�
    python scripts\run_local_web_app.py --data-root .\data
    ```
 
-   浏览器打开 `http://127.0.0.1:8000` 并登录。默认仅监听本机；如需局域网访问，请配置受控网络、HTTPS 和 `SESSION_COOKIE_SECURE=true`。
 
 ## 任务流程
 
@@ -111,6 +109,3 @@ FINANCE 用户可以创建、补资料和启动任务；REVIEWER 或 ADMIN 用�
 
 ```powershell
 python -m unittest discover -s tests -v
-```
-
-单元测试使用 SQLite 临时库和 MinIO 假对象客户端验证业务仓储、上传索引、版本控制、认证、权限、对象引用恢复和工作流规则；完整服务上线前还需在实际 PostgreSQL 与 MinIO 实例上做集成验收。
