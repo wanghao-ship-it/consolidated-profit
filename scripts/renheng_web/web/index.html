@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>仁恒合并利润表工作台</title>
+  <style>
+    body { max-width: 1100px; margin: 32px auto; padding: 0 20px; font-family: system-ui, sans-serif; color: #202124; }
+    section { border: 1px solid #d8dbe0; border-radius: 10px; padding: 18px; margin: 16px 0; }
+    label { display: inline-flex; flex-direction: column; gap: 6px; margin-right: 18px; }
+    input, button { padding: 8px 10px; font: inherit; }
+    button { cursor: pointer; }
+    pre { white-space: pre-wrap; background: #f6f8fa; padding: 12px; border-radius: 6px; }
+    .ok { color: #137333; } .warn { color: #b06000; } .error { color: #b3261e; }
+    table { border-collapse: collapse; width: 100%; margin-top: 12px; }
+    th, td { border-bottom: 1px solid #ddd; padding: 8px; text-align: left; }
+    .hidden { display: none; }
+  </style>
+</head>
+<body>
+  <h1>仁恒合并利润表工作台</h1>
+  <section>
+    <h2>运行记录</h2>
+    <button id="refresh-history">刷新记录</button>
+    <table><thead><tr><th>任务</th><th>期间</th><th>经办人</th><th>状态</th><th>更新时间</th><th>操作</th></tr></thead><tbody id="history"></tbody></table>
+  </section>
+  <section>
+    <h2>新建任务</h2>
+    <form id="new-run">
+      <label>年度<input name="year" type="number" value="2026" required></label>
+      <label>月份<input name="month" type="number" min="1" max="12" value="2" required></label>
+      <label>经办人<input name="operator" required></label>
+      <label>资料文件<input name="files" type="file" multiple required></label>
+      <button type="submit">上传并创建任务</button>
+    </form>
+    <p id="new-run-message"></p>
+  </section>
+
+  <section>
+    <h2>当前任务</h2>
+    <div id="run-summary">尚未创建任务。</div>
+    <button id="preflight" class="hidden">重新预检资料</button>
+    <form id="add-files" class="hidden">
+      <label>补充或替换资料<input name="files" type="file" multiple required></label>
+      <button type="submit">上传补充资料</button>
+    </form>
+    <button id="start" class="hidden">开始计算</button>
+    <div id="review" class="hidden">
+      <h3>差异审核</h3>
+      <pre id="differences"></pre>
+      <form id="correction">
+        <label>审核人<input name="reviewed_by" required></label>
+        <label>修正原因<input name="reason" required></label>
+        <div id="correction-fields"></div>
+        <button type="submit">提交审核并继续</button>
+      </form>
+    </div>
+    <div id="artifacts"></div>
+  </section>
+
+  <script>
+    let currentRun = null;
+    const $ = (id) => document.getElementById(id);
+    const esc = (value) => String(value ?? '').replace(/[&<>"']/g, (ch) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+    const labels = {
+      current_month: '本年本月', current_cumulative: '本年累计',
+      prior_month: '去年同期本月', prior_cumulative: '去年同期累计'
+    };
+
+    $('new-run').addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const response = await fetch('/api/runs', { method: 'POST', body: new FormData(event.target) });
+      const data = await response.json();
+      if (!response.ok) { $('new-run-message').className = 'error'; $('new-run-message').textContent = data.detail || '创建失败'; return; }
+      currentRun = data.run_id;
+      $('new-run-message').className = 'ok';
+      $('new-run-message').textContent = `任务 ${currentRun} 已创建，已上传 ${data.uploaded.length} 个文件。`;
+      $('preflight').classList.remove('hidden');
+      $('add-files').classList.remove('hidden');
+      await runPreflight();
+      refresh();
+    });
+
+    $('preflight').addEventListener('click', runPreflight);
+
+    $('add-files').addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const response = await fetch(`/api/runs/${currentRun}/files`, { method: 'POST', body: new FormData(event.target) });
+      const data = await response.json();
+      if (!response.ok) { $('new-run-message').className = 'error'; $('new-run-message').textContent = data.detail || '补充资料失败'; return; }
+      $('new-run-message').className = 'ok';
+      $('new-run-message').textContent = `已补充 ${data.uploaded.length} 个文件，正在重新预检。`;
+      await runPreflight();
+    });
+
+    $('start').addEventListener('click', async () => {
+      const response = await fetch(`/api/runs/${currentRun}/start`, { method: 'POST' });
+      if (!response.ok) { const data = await response.json(); $('new-run-message').className = 'error'; $('new-run-message').textContent = data.detail || '启动失败'; return; }
+      $('start').classList.add('hidden'); refresh();
+    });
+
+    $('refresh-history').addEventListener('click', loadHistory);
+
+    $('correction').addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const form = new FormData(event.target);
+      const corrected_revenue = {};
+      document.querySelectorAll('[data-revenue-key]').forEach((input) => { corrected_revenue[input.dataset.revenueKey] = input.value || null; });
+      const body = { reviewed_by: form.get('reviewed_by'), reason: form.get('reason'), corrected_revenue };
+      const response = await fetch(`/api/runs/${currentRun}/resume`, { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body) });
+      if (!response.ok) { const data = await response.json(); alert(data.detail || '恢复失败'); return; }
+      $('review').classList.add('hidden'); refresh();
+    });
+
+    async function refresh() {
+      if (!currentRun) return;
+      const response = await fetch(`/api/runs/${currentRun}`); const data = await response.json();
+      const statusClass = data.workflow_status === 'WAITING_REVIEW' ? 'warn' : data.workflow_status === 'SUCCEEDED' ? 'ok' : data.workflow_status === 'FAILED' ? 'error' : '';
+      const preflight = data.preflight;
+      const preflightText = preflight?.ok ? `预检通过，识别 ${preflight.files?.length || 0} 个文件。` : preflight?.error ? `预检未通过：${esc(preflight.error)}` : '尚未预检资料。';
+      $('run-summary').innerHTML = `<strong>${esc(data.run_id)}</strong>　状态：<span class="${statusClass}">${esc(data.workflow_status)}</span><br>审核轮次：${data.review_round || 0}<br>${preflightText}`;
+      $('start').classList.toggle('hidden', data.preflight_status !== 'PASSED' || !['DRAFT', 'FAILED'].includes(data.status));
+      if (data.workflow_status === 'WAITING_REVIEW') {
+        $('review').classList.remove('hidden');
+        $('differences').textContent = JSON.stringify({m7_differences: data.m7_differences, subject_differences: data.subject_differences, unbilled_evidence: data.unbilled_evidence}, null, 2);
+        renderCorrectionFields(data);
+      } else {
+        $('review').classList.add('hidden');
+        $('correction-fields').replaceChildren();
+        delete $('correction-fields').dataset.signature;
+      }
+      if (data.workflow_status === 'FAILED') $('run-summary').innerHTML += `<pre class="error">${data.error?.message || data.error_message || '执行失败'}</pre>`;
+      const artifacts = data.artifacts || {};
+      $('artifacts').innerHTML = Object.entries(artifacts).map(([key, name]) => `<a href="/api/runs/${currentRun}/artifacts/${encodeURIComponent(key)}" target="_blank">下载 ${key}（${name}）</a>`).join('<br>');
+      if (['RUNNING', 'QUEUED', 'WAITING_REVIEW'].includes(data.workflow_status)) setTimeout(refresh, 1500);
+    }
+
+    function renderCorrectionFields(data) {
+      const needed = new Set();
+      (data.m7_differences || []).forEach(row => {
+        const difference = Number(String(row['差异'] ?? '').replace(/,/g, ''));
+        if (!Number.isFinite(difference) || difference !== 0) {
+          needed.add(row['年度类型'] === '本年'
+            ? (row['范围'] === '本月' ? 'current_month' : 'current_cumulative')
+            : (row['范围'] === '本月' ? 'prior_month' : 'prior_cumulative'));
+        }
+      });
+      const keys = [...needed];
+      const container = $('correction-fields');
+      const signature = keys.join('|');
+      // 状态轮询会频繁触发 refresh；差异范围未变化时不能重建 input，
+      // 否则输入框会失去焦点且财务已填写的金额会被清空。
+      if (container.dataset.signature === signature) return;
+      const previousValues = {};
+      container.querySelectorAll('[data-revenue-key]').forEach(input => {
+        previousValues[input.dataset.revenueKey] = input.value;
+      });
+      container.innerHTML = keys.map(key => `<label>${labels[key]}正确营业收入<input data-revenue-key="${key}" type="number" step="0.01" inputmode="decimal" value="${esc(previousValues[key] || '')}" required></label>`).join('');
+      container.dataset.signature = signature;
+    }
+
+    async function runPreflight() {
+      if (!currentRun) return;
+      $('new-run-message').className = '';
+      $('new-run-message').textContent = '正在检查资料，请稍候……';
+      const response = await fetch(`/api/runs/${currentRun}/preflight`, { method: 'POST' });
+      const data = await response.json();
+      if (!response.ok) {
+        $('new-run-message').className = 'error';
+        $('new-run-message').textContent = data.detail || '预检请求失败';
+      } else if (data.preflight_status === 'PASSED') {
+        $('new-run-message').className = 'ok';
+        $('new-run-message').textContent = '资料预检通过，可以开始计算。';
+      } else {
+        $('new-run-message').className = 'error';
+        $('new-run-message').textContent = data.error_message || data.preflight?.error || '资料预检未通过，请补充或替换文件。';
+      }
+      refresh();
+    }
+
+    async function loadHistory() {
+      const response = await fetch('/api/runs'); const rows = await response.json();
+      $('history').innerHTML = rows.map(row => `<tr><td>${esc(row.run_id)}</td><td>${esc(row.year)}-${String(row.month).padStart(2, '0')}</td><td>${esc(row.operator)}</td><td>${esc(row.status)}</td><td>${esc(row.updated_at)}</td><td><button onclick="selectRun('${esc(row.run_id)}')">查看</button></td></tr>`).join('');
+    }
+
+    window.selectRun = (runId) => { currentRun = runId; $('preflight').classList.remove('hidden'); $('add-files').classList.remove('hidden'); refresh(); };
+    loadHistory();
+  </script>
+</body>
+</html>
