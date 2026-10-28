@@ -240,6 +240,8 @@ class WorkflowService:
                     else Path(value).name
                     for role, value in selected.items()
                 },
+                "current_period_policy": state["current_period_policy"],
+                "prior_period_policy": state["prior_period_policy"],
                 "current_input_fingerprint": state["current_input_fingerprint"],
                 "prior_input_fingerprint": state["prior_input_fingerprint"],
             }
@@ -280,8 +282,11 @@ class WorkflowService:
             if row.get("preflight_status") != "PASSED":
                 raise ValueError(row.get("error_message") or "资料预检未通过")
         self._hydrate_files(run_id)
+        workflow_input = self._workflow_input(row)
         self.app_repository.queue_start(run_id)
-        self._executor.submit(self._invoke_start, self._require_run(run_id))
+        self._executor.submit(
+            self._invoke_start, self._require_run(run_id), workflow_input
+        )
         return self.get_status(run_id)
 
     def resume(
@@ -313,20 +318,83 @@ class WorkflowService:
 
     def _workflow_input(self, row: dict[str, Any]) -> dict[str, Any]:
         _, source_dir, output_root = self._run_paths(row["run_id"])
-        return {
+        preflight_result = row.get("preflight_result")
+        if not isinstance(preflight_result, dict) or not preflight_result.get("ok"):
+            raise ValueError("缺少有效的资料预检结果，请重新预检")
+
+        saved_names = preflight_result.get("selected_files")
+        if not isinstance(saved_names, dict):
+            raise ValueError("预检结果缺少已确认的文件清单，请重新预检")
+
+        list_keys = (
+            "current_profit_statements",
+            "prior_profit_statements",
+            "current_invoice_files",
+        )
+        scalar_keys = (
+            "current_sales_ledger",
+            "prior_sales_ledger",
+            "template_file",
+        )
+        required_keys = set(list_keys) | set(scalar_keys)
+        if not required_keys.issubset(saved_names):
+            raise ValueError("预检文件清单不完整，请重新预检")
+
+        input_root = source_dir.resolve()
+
+        def resolve_input_name(name: Any) -> str:
+            filename = str(name)
+            if not filename or Path(filename).name != filename:
+                raise ValueError("预检结果中的输入文件名无效，请重新预检")
+            path = (input_root / filename).resolve()
+            if path.parent != input_root or not path.is_file():
+                raise FileNotFoundError(f"预检确认的文件不存在，请重新预检：{filename}")
+            return str(path)
+
+        selected_files: dict[str, str | list[str]] = {}
+        for key in list_keys:
+            names = saved_names[key]
+            if not isinstance(names, list) or not names:
+                raise ValueError(f"预检结果中的文件清单无效：{key}")
+            selected_files[key] = [resolve_input_name(name) for name in names]
+        for key in scalar_keys:
+            name = saved_names[key]
+            if not isinstance(name, str):
+                raise ValueError(f"预检结果中的文件清单无效：{key}")
+            selected_files[key] = resolve_input_name(name)
+
+        from langgraph_profit_workflow import (
+            determine_period_policy_values,
+            verify_preflight_fingerprints,
+        )
+
+        state = {
             "year": row["year"],
             "month": row["month"],
             "source_dir": str(source_dir),
             "output_root": str(output_root),
+            "current_period_policy": preflight_result.get("current_period_policy")
+            or determine_period_policy_values(row["year"], row["month"]),
+            "prior_period_policy": preflight_result.get("prior_period_policy")
+            or determine_period_policy_values(row["year"] - 1, row["month"]),
+            "selected_files": selected_files,
+            "current_input_fingerprint": preflight_result.get(
+                "current_input_fingerprint"
+            ),
+            "prior_input_fingerprint": preflight_result.get(
+                "prior_input_fingerprint"
+            ),
         }
+        verify_preflight_fingerprints(state)
+        return state
 
-    def _invoke_start(self, row: dict[str, Any]) -> None:
+    def _invoke_start(self, row: dict[str, Any], workflow_input: dict[str, Any]) -> None:
         self.app_repository.update(row["run_id"], status="RUNNING")
         try:
             self._hydrate_files(row["run_id"])
             with self._graph_lock:
                 result = self._ensure_graph().invoke(
-                    self._workflow_input(row), config=self._config(row)
+                    workflow_input, config=self._config(row)
                 )
             self._sync_result(row, result)
         except Exception as error:

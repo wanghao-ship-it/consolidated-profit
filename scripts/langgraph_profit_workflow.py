@@ -82,6 +82,11 @@ class ProfitWorkflowInput(BaseModel):
     month: int = Field(ge=1, le=12)
     source_dir: Path
     output_root: Path
+    current_period_policy: dict[str, Any]
+    prior_period_policy: dict[str, Any]
+    selected_files: dict[str, str | list[str]]
+    current_input_fingerprint: str
+    prior_input_fingerprint: str
 
 
 class ProfitWorkflowState(TypedDict, total=False):
@@ -143,8 +148,10 @@ def determine_period_policy(state: ProfitWorkflowState) -> dict[str, Any]:
     return {
         "workflow_status": "RUNNING",
         "review_round": 0,
-        "current_period_policy": determine_period_policy_values(state["year"], state["month"]),
-        "prior_period_policy": determine_period_policy_values(state["year"] - 1, state["month"]),
+        "current_period_policy": state.get("current_period_policy")
+        or determine_period_policy_values(state["year"], state["month"]),
+        "prior_period_policy": state.get("prior_period_policy")
+        or determine_period_policy_values(state["year"] - 1, state["month"]),
         "artifacts": {},
         "review_history": [],
         "formal_report": None,
@@ -224,11 +231,6 @@ def _fingerprint(paths: list[Path], policy: dict[str, Any]) -> str:
     return digest.hexdigest()
 
 
-def _serialize_sources(sources: list[core.SourceFile]) -> list[str]:
-    """将选中的利润表主体转换为 Checkpoint 可保存的文件路径列表。"""
-    return [source.path for source in sources]
-
-
 def _company_for_profit_path(path: Path) -> str:
     name = core.compact_text(path.name)
     matches = [
@@ -269,6 +271,17 @@ def _prior_fingerprint_paths(state: ProfitWorkflowState) -> list[Path]:
         *(Path(path) for path in selected["prior_profit_statements"]),
         Path(str(selected["prior_sales_ledger"])),
     ]
+
+
+def verify_preflight_fingerprints(state: ProfitWorkflowState) -> None:
+    """在启动工作流前轻量核对文件/规则指纹，不重复执行完整资料预检。"""
+    current = _fingerprint(_current_fingerprint_paths(state), state["current_period_policy"])
+    prior = _fingerprint(_prior_fingerprint_paths(state), state["prior_period_policy"])
+    if (
+        current != state.get("current_input_fingerprint")
+        or prior != state.get("prior_input_fingerprint")
+    ):
+        raise ValueError("预检后输入文件或期间规则发生变化，请重新预检资料")
 
 
 def preflight(state: ProfitWorkflowState) -> dict[str, Any]:
@@ -1016,7 +1029,6 @@ def build_workflow(checkpointer=None, artifact_persister=None, artifact_resolver
 
     builder = StateGraph(ProfitWorkflowState)
     builder.add_node("determine_period_policy", _wrap_node(determine_period_policy, artifact_persister, artifact_resolver))
-    builder.add_node("preflight", _wrap_node(preflight, artifact_persister, artifact_resolver))
     builder.add_node("prepare_run", _wrap_node(prepare_run, artifact_persister, artifact_resolver))
     builder.add_node(
         "current_year_subgraph",
@@ -1033,8 +1045,7 @@ def build_workflow(checkpointer=None, artifact_persister=None, artifact_resolver
     builder.add_node("publish_report", _wrap_node(publish_report, artifact_persister, artifact_resolver))
 
     builder.add_edge(START, "determine_period_policy")
-    builder.add_edge("determine_period_policy", "preflight")
-    builder.add_edge("preflight", "prepare_run")
+    builder.add_edge("determine_period_policy", "prepare_run")
     builder.add_edge("prepare_run", "current_year_subgraph")
     builder.add_edge("current_year_subgraph", "prior_year_subgraph")
     builder.add_edge("prior_year_subgraph", "m6_preview")
