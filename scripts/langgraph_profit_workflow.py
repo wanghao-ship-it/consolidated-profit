@@ -231,6 +231,11 @@ def _fingerprint(paths: list[Path], policy: dict[str, Any]) -> str:
     return digest.hexdigest()
 
 
+def _serialize_sources(sources: list[core.SourceFile]) -> list[str]:
+    """将已选利润表主体转换为可写入 Checkpoint 的文件路径列表。"""
+    return [source.path for source in sources]
+
+
 def _company_for_profit_path(path: Path) -> str:
     name = core.compact_text(path.name)
     matches = [
