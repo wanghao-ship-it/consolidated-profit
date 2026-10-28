@@ -162,7 +162,6 @@ python -m unittest discover -s tests -v
 ## 文档
 
 - [网页工作台启动说明](scripts/WEB_APP.md)
-- [业务规则说明](references/BUSINESS_RULES.md)
 - [代码逐行技术讲解](代码逐行技术讲解.md)
 
 ## 使用范围与公开前检查
