@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""仁恒合并利润表的 LangGraph 编排层。
+"""仁恒合并利润表的 LangGraph 工作流编排层。
 
 金额计算复用 ``renheng_profit`` 中的确定性函数。本模块只保存可序列化状态和
 文件引用，负责节点、分支、Checkpoint、interrupt 和发布门禁；工作流由网页服务
